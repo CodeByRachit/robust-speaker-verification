@@ -107,16 +107,32 @@ def trim_silence(waveform, sr=16000, frame_ms=30, threshold_db=25):
     end_sample = min(waveform.shape[1], (active_idx[-1] + 1) * frame_len + int(0.2 * sr))
     return waveform[:, start_sample:end_sample]
 
-def extract_template(waveform, model, device, win_sec=3.0, step_sec=0.75, sr=16000):
+def extract_template(waveform, model, device, win_sec=3.0, step_sec=0.5, max_total_sec=4.0, sr=16000):
     """
-    Robust Windowed Template Extraction with Energy Weighting:
-    Trims leading/trailing room silence, extracts sliding 3-second windows across
-    active speech, and computes an energy-weighted ensemble speaker embedding to
-    prevent silent pauses from biasing the biometric vector.
+    Robust Windowed Template Extraction with Primary Speech Windowing:
+    1. Trims leading/trailing room silence and ambient hum.
+    2. Constrains evaluation to the primary continuous 4.0-second speech segment around
+       peak energy (matching the model's 4.0-second training duration and preventing
+       subsequent room noise or background talkers from corrupting the biometric template).
+    3. Extracts sliding 3-second windows with energy weighting.
     """
     trimmed = trim_silence(waveform, sr=sr)
+    max_len = int(max_total_sec * sr)
     win = int(win_sec * sr)
     step = int(step_sec * sr)
+
+    # If speech exceeds 4.0 seconds, isolate the primary speech segment around peak energy
+    if trimmed.shape[1] > max_len:
+        best_start = 0
+        max_energy = -1.0
+        for s in range(0, trimmed.shape[1] - max_len + 1, int(0.25 * sr)):
+            chunk = trimmed[:, s:s+max_len]
+            e = float(torch.sum(chunk**2))
+            if e > max_energy:
+                max_energy = e
+                best_start = s
+        trimmed = trimmed[:, best_start:best_start+max_len]
+
     slices = []
     weights = []
     if trimmed.shape[1] <= win:
