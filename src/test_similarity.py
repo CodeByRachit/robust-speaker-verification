@@ -31,7 +31,13 @@ def cosine_similarity(v1, v2):
         return 0.0
     return float(dot / (n1 * n2))
 
-def load_audio(path, max_length_sec=None, sample_rate=16000):
+def load_audio(path, max_length_sec=3.5, sample_rate=16000, apply_vad=True):
+    """
+    Loads audio, resamples to 16kHz, converts to mono, applies Voice Activity
+    Detection (VAD) to strip room silence/breathing, windows to the active speech
+    segment (default 3.5s matching the training distribution), and performs
+    waveform Mean and Variance Normalization (CMVN) to eliminate microphone gain bias.
+    """
     waveform, sr = torchaudio.load(path)
     if sr != sample_rate:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
@@ -39,20 +45,53 @@ def load_audio(path, max_length_sec=None, sample_rate=16000):
     if waveform.shape[0] > 1:
         waveform = torch.mean(waveform, dim=0, keepdim=True)
         
-    # Standard zero-mean normalization to eliminate DC bias from microphone
+    # 1. Zero-mean normalization to eliminate hardware DC bias
     waveform = waveform - torch.mean(waveform)
             
-    # Ensure minimum length of 1.0s (16,000 samples) for ECAPA-TDNN convolutional receptive field
-    if waveform.shape[1] < 16000:
-        waveform = torch.nn.functional.pad(waveform, (0, 16000 - waveform.shape[1]))
+    # 2. Energy-based Voice Activity Detection (VAD) to extract active speech
+    if apply_vad and waveform.shape[1] > 16000:
+        frame_len = int(0.025 * sample_rate)
+        hop_len = int(0.010 * sample_rate)
+        frames, energies = [], []
+        for i in range(0, waveform.shape[1] - frame_len, hop_len):
+            chunk = waveform[:, i:i+frame_len]
+            e = torch.sum(chunk ** 2).item()
+            energies.append(e)
+            frames.append(chunk)
             
+        if len(energies) > 0:
+            energies = np.array(energies)
+            noise_floor = np.percentile(energies, 20)
+            speech_thresh = noise_floor + 0.15 * (np.percentile(energies, 85) - noise_floor)
+            voiced_frames = [frames[i] for i, e in enumerate(energies) if e > speech_thresh]
+            if len(voiced_frames) > 0:
+                waveform = torch.cat(voiced_frames, dim=1)
+
+    # 3. Window selection: Extract highest-energy 3.5s active speech segment
     if max_length_sec is not None:
-        max_length = int(max_length_sec * sample_rate)
-        if waveform.shape[1] > max_length:
-            waveform = waveform[:, :max_length]
-        else:
-            pad_amount = max_length - waveform.shape[1]
-            waveform = torch.nn.functional.pad(waveform, (0, pad_amount))
+        target_samples = int(max_length_sec * sample_rate)
+        if waveform.shape[1] > target_samples:
+            best_start = 0
+            max_energy = -1.0
+            step = int(0.5 * sample_rate)
+            for s in range(0, waveform.shape[1] - target_samples + 1, step):
+                win = waveform[:, s:s+target_samples]
+                e = torch.sum(win ** 2).item()
+                if e > max_energy:
+                    max_energy = e
+                    best_start = s
+            waveform = waveform[:, best_start:best_start+target_samples]
+        elif waveform.shape[1] < 16000:
+            waveform = torch.nn.functional.pad(waveform, (0, 16000 - waveform.shape[1]))
+    elif waveform.shape[1] < 16000:
+        waveform = torch.nn.functional.pad(waveform, (0, 16000 - waveform.shape[1]))
+
+    # 4. Cepstral / Waveform Mean and Variance Normalization (CMVN)
+    waveform = waveform - torch.mean(waveform)
+    std = torch.std(waveform)
+    if std > 1e-6:
+        waveform = waveform / std
+
     return waveform
 
 def scan_dataset(data_dir):

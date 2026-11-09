@@ -34,7 +34,13 @@ def cosine_similarity(v1, v2):
         return 0.0
     return float(dot / (n1 * n2))
 
-def load_audio(path, max_length_sec=None, sample_rate=16000):
+def load_audio(path, max_length_sec=3.5, sample_rate=16000, apply_vad=True):
+    """
+    Loads audio, resamples to 16kHz, converts to mono, applies Voice Activity
+    Detection (VAD) to strip room silence/breathing, windows to the active speech
+    segment (default 3.5s matching the training distribution), and performs
+    waveform Mean and Variance Normalization (CMVN) to eliminate microphone gain bias.
+    """
     waveform, sr = torchaudio.load(path)
     if sr != sample_rate:
         resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=sample_rate)
@@ -42,20 +48,53 @@ def load_audio(path, max_length_sec=None, sample_rate=16000):
     if waveform.shape[0] > 1:
         waveform = torch.mean(waveform, dim=0, keepdim=True)
         
-    # Standard zero-mean normalization to eliminate DC bias from microphone
+    # 1. Zero-mean normalization to eliminate hardware DC bias
     waveform = waveform - torch.mean(waveform)
             
-    # Ensure minimum length of 1.0s (16,000 samples) for ECAPA-TDNN convolutional receptive field
-    if waveform.shape[1] < 16000:
-        waveform = torch.nn.functional.pad(waveform, (0, 16000 - waveform.shape[1]))
+    # 2. Energy-based Voice Activity Detection (VAD) to extract active speech
+    if apply_vad and waveform.shape[1] > 16000:
+        frame_len = int(0.025 * sample_rate)
+        hop_len = int(0.010 * sample_rate)
+        frames, energies = [], []
+        for i in range(0, waveform.shape[1] - frame_len, hop_len):
+            chunk = waveform[:, i:i+frame_len]
+            e = torch.sum(chunk ** 2).item()
+            energies.append(e)
+            frames.append(chunk)
             
+        if len(energies) > 0:
+            energies = np.array(energies)
+            noise_floor = np.percentile(energies, 20)
+            speech_thresh = noise_floor + 0.15 * (np.percentile(energies, 85) - noise_floor)
+            voiced_frames = [frames[i] for i, e in enumerate(energies) if e > speech_thresh]
+            if len(voiced_frames) > 0:
+                waveform = torch.cat(voiced_frames, dim=1)
+
+    # 3. Window selection: Extract highest-energy 3.5s active speech segment
     if max_length_sec is not None:
-        max_length = int(max_length_sec * sample_rate)
-        if waveform.shape[1] > max_length:
-            waveform = waveform[:, :max_length]
-        else:
-            pad_amount = max_length - waveform.shape[1]
-            waveform = torch.nn.functional.pad(waveform, (0, pad_amount))
+        target_samples = int(max_length_sec * sample_rate)
+        if waveform.shape[1] > target_samples:
+            best_start = 0
+            max_energy = -1.0
+            step = int(0.5 * sample_rate)
+            for s in range(0, waveform.shape[1] - target_samples + 1, step):
+                win = waveform[:, s:s+target_samples]
+                e = torch.sum(win ** 2).item()
+                if e > max_energy:
+                    max_energy = e
+                    best_start = s
+            waveform = waveform[:, best_start:best_start+target_samples]
+        elif waveform.shape[1] < 16000:
+            waveform = torch.nn.functional.pad(waveform, (0, 16000 - waveform.shape[1]))
+    elif waveform.shape[1] < 16000:
+        waveform = torch.nn.functional.pad(waveform, (0, 16000 - waveform.shape[1]))
+
+    # 4. Cepstral / Waveform Mean and Variance Normalization (CMVN)
+    waveform = waveform - torch.mean(waveform)
+    std = torch.std(waveform)
+    if std > 1e-6:
+        waveform = waveform / std
+
     return waveform
 
 def record_audio_mic(output_path, duration=10, sample_rate=16000):
@@ -191,7 +230,7 @@ def get_or_fit_mmse_estimators(model, device, data_dir=AVID_DIR):
 
     return mmse_loud, mmse_soft, global_mean
 
-def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_soft, global_mean):
+def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_soft, global_mean, effort_mode="auto"):
     """
     Extracts embeddings for both voice recordings, runs baseline vs MMSE compensated verification,
     and returns comprehensive similarity scores and biometric verdicts.
@@ -214,21 +253,36 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
 
     sim_base_cen = centered_cosine(emb1, emb2)
 
-    # MMSE Vocal Effort Compensations (Test Voice compensation as in paper Image 2)
+    # MMSE Vocal Effort Compensations
     emb2_loud_comp = mmse_loud.compensate(emb2)
     sim_loud_cen = centered_cosine(emb1, emb2_loud_comp)
 
     emb2_soft_comp = mmse_soft.compensate(emb2)
     sim_soft_cen = centered_cosine(emb1, emb2_soft_comp)
 
-    # Symmetric compensation in case reference voice had vocal effort
-    emb1_loud_comp = mmse_loud.compensate(emb1)
-    sim_v1_loud_cen = centered_cosine(emb1_loud_comp, emb2)
-    emb1_soft_comp = mmse_soft.compensate(emb1)
-    sim_v1_soft_cen = centered_cosine(emb1_soft_comp, emb2)
+    # 3. Acoustic Vocal Effort Detection from speech dynamics
+    w1_raw, _ = torchaudio.load(audio_path1)
+    w2_raw, _ = torchaudio.load(audio_path2)
+    rms1 = float(torch.sqrt(torch.mean(w1_raw ** 2))) + 1e-6
+    rms2 = float(torch.sqrt(torch.mean(w2_raw ** 2))) + 1e-6
+    energy_ratio = rms2 / rms1
 
-    # Best calibrated similarity across potential vocal effort conditions
-    calibrated_sim = max(sim_base_cen, sim_loud_cen, sim_soft_cen, sim_v1_loud_cen, sim_v1_soft_cen)
+    vocal_effort_detected = False
+    effort_type = "Normal Speech"
+
+    # Determine whether vocal effort compensation is needed:
+    if effort_mode == "loud" or (effort_mode == "auto" and energy_ratio >= 2.5):
+        vocal_effort_detected = True
+        effort_type = "Shouted / Loud Speech"
+        calibrated_sim = max(sim_base_cen, sim_loud_cen)
+    elif effort_mode == "soft" or (effort_mode == "auto" and energy_ratio <= 0.20):
+        vocal_effort_detected = True
+        effort_type = "Whispered / Soft Speech"
+        calibrated_sim = max(sim_base_cen, sim_soft_cen)
+    else:
+        # Standard neutral speech verification (matches paper Figure 1 Normal condition)
+        calibrated_sim = sim_base_cen
+
     is_same_person = (calibrated_sim >= CALIBRATED_THRESHOLD)
     calibrated_verdict = "SAME PERSON" if is_same_person else "DIFFERENT PERSON"
 
@@ -239,16 +293,6 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
     else:
         margin = CALIBRATED_THRESHOLD - calibrated_sim
         conf = 70.0 + min(29.5, (margin / (CALIBRATED_THRESHOLD + 1.0 + 1e-6)) * 30.0)
-
-    # Detect if vocal effort shift was active
-    vocal_effort_detected = False
-    effort_type = "Normal"
-    if max(sim_loud_cen, sim_v1_loud_cen) > sim_base_cen + 0.02:
-        vocal_effort_detected = True
-        effort_type = "Shouted / Loud Speech"
-    elif max(sim_soft_cen, sim_v1_soft_cen) > sim_base_cen + 0.02:
-        vocal_effort_detected = True
-        effort_type = "Whispered / Soft Speech"
 
     return {
         'raw_sim': raw_sim,
@@ -261,7 +305,8 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
         'calibrated_verdict': calibrated_verdict,
         'confidence': conf,
         'vocal_effort_detected': vocal_effort_detected,
-        'effort_type': effort_type
+        'effort_type': effort_type,
+        'energy_ratio': energy_ratio
     }
 
 def print_result_card(results, path1, path2):
@@ -331,6 +376,7 @@ def main():
     parser.add_argument("--voice1", "--audio1", type=str, dest="voice1", default=None, help="Optional path to existing Voice 1 .wav file")
     parser.add_argument("--voice2", "--audio2", type=str, dest="voice2", default=None, help="Optional path to existing Voice 2 .wav file")
     parser.add_argument("--duration", type=int, default=10, help="Recording duration in seconds (default: 10)")
+    parser.add_argument("--effort", type=str, choices=["auto", "normal", "loud", "soft"], default="auto", help="Vocal effort evaluation mode (default: auto)")
     parser.add_argument("--checkpoint", type=str, default=os.path.join(BASE_DIR, "checkpoint_epoch_20.pth"), help="Path to checkpoint")
     args = parser.parse_args()
 
@@ -426,7 +472,7 @@ def main():
 
     # Run Verification
     print("\n[Step 3/3] Running deep feature extraction & Bayesian MMSE compensation...")
-    results = run_verification(v1_path, v2_path, model, device, mmse_loud, mmse_soft, global_mean)
+    results = run_verification(v1_path, v2_path, model, device, mmse_loud, mmse_soft, global_mean, effort_mode=args.effort)
 
     # Display results
     print_result_card(results, v1_path, v2_path)
