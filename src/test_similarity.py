@@ -89,7 +89,12 @@ def extract_template(waveform, model, device, win_sec=3.5, step_sec=1.5, sr=1600
 
     mean_emb = np.mean(embs, axis=0)
     raw_first_emb = embs[0]
-    return mean_emb, raw_first_emb, len(slices)
+    if len(embs) > 1:
+        self_sims = [cosine_similarity(embs[i], embs[j]) for i in range(len(embs)) for j in range(i+1, len(embs))]
+        self_sim = float(np.mean(self_sims))
+    else:
+        self_sim = 1.0
+    return mean_emb, raw_first_emb, len(slices), self_sim
 
 def scan_dataset(data_dir):
     raw_files = glob.glob(os.path.join(data_dir, "**", "*.wav"), recursive=True)
@@ -135,8 +140,8 @@ def get_mmse_cache(model, device, catalog):
             for nf, vf in pairs:
                 w_n = preprocess_audio(nf)
                 w_v = preprocess_audio(vf)
-                t_n, _, _ = extract_template(w_n, model, device)
-                t_v, _, _ = extract_template(w_v, model, device)
+                t_n, _, _, _ = extract_template(w_n, model, device)
+                t_v, _, _, _ = extract_template(w_v, model, device)
                 X_n.append(t_n)
                 X_v.append(t_v)
         X_n, X_v = np.vstack(X_n), np.vstack(X_v)
@@ -166,8 +171,11 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
     w1 = preprocess_audio(path1)
     w2 = preprocess_audio(path2)
 
-    t1, raw_e1, n1 = extract_template(w1, model, device)
-    t2, raw_e2, n2 = extract_template(w2, model, device)
+    t1, raw_e1, n1, self_sim1 = extract_template(w1, model, device)
+    t2, raw_e2, n2, self_sim2 = extract_template(w2, model, device)
+
+    # Dynamic threshold calibrated to enrollment consistency
+    threshold = float(min(0.8800, max(0.8600, self_sim1 - 0.065)))
 
     raw_sim = cosine_similarity(raw_e1, raw_e2)
     sim_base_template = cosine_similarity(t1, t2)
@@ -205,15 +213,15 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
         compensation_applied = "None (Neutral Phonation Baseline)"
         calibrated_sim = sim_base_template
 
-    is_same = (calibrated_sim >= CALIBRATED_THRESHOLD)
+    is_same = (calibrated_sim >= threshold)
     verdict = "SAME PERSON (MATCH)" if is_same else "DIFFERENT PERSON (IMPOSTOR)"
 
     if is_same:
-        margin = calibrated_sim - CALIBRATED_THRESHOLD
-        conf = 70.0 + min(29.5, (margin / (1.0 - CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
+        margin = calibrated_sim - threshold
+        conf = 70.0 + min(29.5, (margin / (1.0 - threshold + 1e-6)) * 30.0)
     else:
-        margin = CALIBRATED_THRESHOLD - calibrated_sim
-        conf = 70.0 + min(29.5, (margin / (CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
+        margin = threshold - calibrated_sim
+        conf = 70.0 + min(29.5, (margin / (threshold + 1e-6)) * 30.0)
 
     # [1] Phonation Box
     print("\n  [1] DETECTED VOCAL EFFORT / PHONATION MODE:")
@@ -239,8 +247,8 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
             "│                      >>> FINAL VERDICT: SAME PERSON (MATCH) <<<                        │",
             "│                                                                                        │",
             f"│   Biometric Confidence  : {conf:.1f}%                                                         │",
-            f"│   Verification Score    : {calibrated_sim:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
-            f"│   Margin Above Threshold: {calibrated_sim - CALIBRATED_THRESHOLD:+.4f}                                                 │",
+            f"│   Verification Score    : {calibrated_sim:+.4f}  (Threshold tau = {threshold:.4f})                 │",
+            f"│   Margin Above Threshold: {calibrated_sim - threshold:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
         ]
@@ -251,8 +259,8 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
             "│                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │",
             "│                                                                                        │",
             f"│   Rejection Confidence  : {conf:.1f}%                                                         │",
-            f"│   Verification Score    : {calibrated_sim:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
-            f"│   Margin Below Threshold: {calibrated_sim - CALIBRATED_THRESHOLD:+.4f}                                                 │",
+            f"│   Verification Score    : {calibrated_sim:+.4f}  (Threshold tau = {threshold:.4f})                 │",
+            f"│   Margin Below Threshold: {calibrated_sim - threshold:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
         ]
@@ -263,8 +271,8 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
     print("-" * 90)
     print(f"{'Pipeline Architecture':<36} | {'Similarity':<12} | {'Threshold':<11} | {'Decision'}")
     print("-" * 90)
-    print(f"{'Image 1: Baseline (Single Window)':<36} | {raw_sim:>12.4f} | {RAW_THRESHOLD:>11.4f} | {'SAME PERSON' if raw_sim >= RAW_THRESHOLD else 'DIFFERENT PERSON'}")
-    print(f"{'Image 2: Full System (MMSE_v + DSP)':<36} | {calibrated_sim:>12.4f} | {CALIBRATED_THRESHOLD:>11.4f} | {verdict}")
+    print(f"{'Image 1: Baseline (Single Window)':<36} | {raw_sim:>12.4f} | {threshold:>11.4f} | {'SAME PERSON' if raw_sim >= threshold else 'DIFFERENT PERSON'}")
+    print(f"{'Image 2: Full System (MMSE_v + DSP)':<36} | {calibrated_sim:>12.4f} | {threshold:>11.4f} | {verdict}")
     print("=" * 90 + "\n")
 
 def test_model(checkpoint_path, data_dir, device=None, voice1=None, voice2=None):
@@ -336,10 +344,10 @@ def test_model(checkpoint_path, data_dir, device=None, voice1=None, voice2=None)
     w_as = preprocess_audio(spk_a_soft)
     w_bn = preprocess_audio(spk_b_norm)
 
-    t_an, _, _ = extract_template(w_an, model, device)
-    t_al, _, _ = extract_template(w_al, model, device)
-    t_as, _, _ = extract_template(w_as, model, device)
-    t_bn, _, _ = extract_template(w_bn, model, device)
+    t_an, _, _, _ = extract_template(w_an, model, device)
+    t_al, _, _, _ = extract_template(w_al, model, device)
+    t_as, _, _, _ = extract_template(w_as, model, device)
+    t_bn, _, _, _ = extract_template(w_bn, model, device)
 
     t_al_c = mmse_loud.compensate(t_al)
     t_as_c = mmse_soft.compensate(t_as)
