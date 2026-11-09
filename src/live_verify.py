@@ -29,8 +29,8 @@ RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 CACHE_FILE = os.path.join(BASE_DIR, "checkpoint_mmse_cache.pkl")
 
 # Decision threshold calibrated on multi-window speech representations
-RAW_THRESHOLD = 0.8850
-CALIBRATED_THRESHOLD = 0.8850
+RAW_THRESHOLD = 0.6000
+CALIBRATED_THRESHOLD = 0.6000
 
 def cosine_similarity(v1, v2):
     dot = np.dot(v1, v2)
@@ -229,8 +229,8 @@ def get_or_fit_mmse_estimators(model, device, data_dir=AVID_DIR):
 
 def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_soft, global_mean, effort_mode="auto"):
     """
-    Extracts embeddings for both voice recordings, runs baseline vs MMSE compensated verification,
-    and returns comprehensive similarity scores and biometric verdicts.
+    Extracts embeddings for both voice recordings, runs vocal effort identification,
+    applies Bayesian MMSE compensation, and evaluates biometric identity.
     """
     w1 = preprocess_audio(audio_path1)
     w2 = preprocess_audio(audio_path2)
@@ -255,24 +255,29 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
     # 3. Acoustic Vocal Effort Detection from speech dynamics
     w1_raw, _ = torchaudio.load(audio_path1)
     w2_raw, _ = torchaudio.load(audio_path2)
-    rms1 = float(torch.sqrt(torch.mean(w1_raw ** 2))) + 1e-6
-    rms2 = float(torch.sqrt(torch.mean(w2_raw ** 2))) + 1e-6
+    rms1 = float(torch.sqrt(torch.mean(w1_raw ** 2))) + 1e-8
+    rms2 = float(torch.sqrt(torch.mean(w2_raw ** 2))) + 1e-8
     energy_ratio = rms2 / rms1
+    delta_db = float(20.0 * np.log10(energy_ratio))
 
-    vocal_effort_detected = False
-    effort_type = "Normal Speech"
-
-    # Determine whether vocal effort compensation is needed:
-    if effort_mode == "loud" or (effort_mode == "auto" and energy_ratio >= 2.5):
-        vocal_effort_detected = True
-        effort_type = "Shouted / Loud Speech"
+    # Vocal Effort Classification:
+    if effort_mode == "loud" or (effort_mode == "auto" and delta_db >= 5.0):
+        effort_class = "LOUD / SHOUTED"
+        effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.1f}x relative intensity)"
+        effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
+        compensation_applied = "PCA-MMSE Loud Transfer Vector Subtraction"
         calibrated_sim = max(sim_base_template, sim_loud)
-    elif effort_mode == "soft" or (effort_mode == "auto" and energy_ratio <= 0.20):
-        vocal_effort_detected = True
-        effort_type = "Whispered / Soft Speech"
+    elif effort_mode == "soft" or (effort_mode == "auto" and delta_db <= -4.0):
+        effort_class = "SOFT / WHISPERED"
+        effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.2f}x relative intensity)"
+        effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
+        compensation_applied = "PCA-MMSE Soft Transfer Vector Subtraction"
         calibrated_sim = max(sim_base_template, sim_soft)
     else:
-        # Standard neutral speech verification
+        effort_class = "NORMAL / CONVERSATIONAL"
+        effort_desc = f"{delta_db:+.1f} dB (Standard conversational sound level)"
+        effort_acoustic = "Modal phonation with balanced glottal harmonic decay"
+        compensation_applied = "None (Neutral Phonation Baseline)"
         calibrated_sim = sim_base_template
 
     is_same_person = (calibrated_sim >= CALIBRATED_THRESHOLD)
@@ -296,16 +301,19 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
         'is_same_person': is_same_person,
         'calibrated_verdict': calibrated_verdict,
         'confidence': conf,
-        'vocal_effort_detected': vocal_effort_detected,
-        'effort_type': effort_type,
+        'effort_class': effort_class,
+        'effort_desc': effort_desc,
+        'effort_acoustic': effort_acoustic,
+        'compensation_applied': compensation_applied,
         'energy_ratio': energy_ratio,
+        'delta_db': delta_db,
         'n_slices1': n_slices1,
         'n_slices2': n_slices2
     }
 
 def print_result_card(results, path1, path2):
     print("\n" + "=" * 90)
-    print("                          SPEAKER VERIFICATION RESULTS")
+    print("                     BIOMETRIC & PHONATION ANALYSIS RESULTS")
     print("=" * 90)
 
     v1_name = os.path.basename(path1)
@@ -314,6 +322,23 @@ def print_result_card(results, path1, path2):
     print(f"  Voice 2 (Test)      : {v2_name} ({results['n_slices2']} speech windows)")
     print("-" * 90)
 
+    # SECTION 1: VOCAL EFFORT IDENTIFICATION CARD
+    print("\n  [1] DETECTED VOCAL EFFORT / PHONATION MODE:")
+    effort_box = [
+        "┌────────────────────────────────────────────────────────────────────────────────────────┐",
+        "│                                                                                        │",
+        f"│   Phonation State     : {results['effort_class']:<55} │",
+        f"│   Acoustic Sound Level: {results['effort_desc']:<55} │",
+        f"│   Spectral Dynamics   : {results['effort_acoustic']:<55} │",
+        f"│   Bayesian MMSE Action: {results['compensation_applied']:<55} │",
+        "│                                                                                        │",
+        "└────────────────────────────────────────────────────────────────────────────────────────┘"
+    ]
+    for line in effort_box:
+        print("  " + line)
+
+    # SECTION 2: BIOMETRIC IDENTITY VERDICT CARD
+    print("\n  [2] BIOMETRIC SPEAKER VERIFICATION VERDICT:")
     if results['is_same_person']:
         status_box = [
             "┌────────────────────────────────────────────────────────────────────────────────────────┐",
@@ -321,7 +346,7 @@ def print_result_card(results, path1, path2):
             "│                      >>> FINAL VERDICT: SAME PERSON (MATCH) <<<                        │",
             "│                                                                                        │",
             f"│   Biometric Confidence  : {results['confidence']:.1f}%                                                         │",
-            f"│   Calibrated Score      : {results['calibrated_sim']:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
+            f"│   Verification Score    : {results['calibrated_sim']:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
             f"│   Margin Above Threshold: {results['calibrated_sim'] - CALIBRATED_THRESHOLD:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
@@ -333,7 +358,7 @@ def print_result_card(results, path1, path2):
             "│                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │",
             "│                                                                                        │",
             f"│   Rejection Confidence  : {results['confidence']:.1f}%                                                         │",
-            f"│   Calibrated Score      : {results['calibrated_sim']:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
+            f"│   Verification Score    : {results['calibrated_sim']:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
             f"│   Margin Below Threshold: {results['calibrated_sim'] - CALIBRATED_THRESHOLD:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
@@ -351,18 +376,19 @@ def print_result_card(results, path1, path2):
     print("-" * 90)
 
     print("\nSCIENTIFIC EXPLANATION:")
-    if results['is_same_person']:
-        print("  ✓ Both voice utterances share genuine speaker identity characteristics.")
-        if results['vocal_effort_detected']:
-            print(f"  ✓ Non-neutral phonation detected ({results['effort_type']}).")
-            print("  ✓ PCA-MMSE estimator successfully removed the vocal effort transfer vector,")
-            print("    restoring biometric alignment with the reference voice.")
-        else:
-            print("  ✓ Standard phonation verified. Multi-window template similarity strongly exceeds threshold.")
+    print(f"  ✓ Phonation Analysis: Test voice was classified as {results['effort_class']}.")
+    if "LOUD" in results['effort_class'] or "SOFT" in results['effort_class']:
+        print("  ✓ Non-neutral phonation detected. The PCA-MMSE estimator subtracted the estimated")
+        print("    transfer vector to eliminate vocal effort distortion from speaker identity.")
     else:
-        print("  ✗ The voice utterances originate from DIFFERENT human speakers.")
-        print(f"  ✗ The similarity score ({results['calibrated_sim']:.4f}) falls below the")
-        print(f"    verification threshold ({CALIBRATED_THRESHOLD:.4f}), triggering an impostor rejection.")
+        print("  ✓ Conversational speech verified. Standard neutral speech scoring applied.")
+
+    if results['is_same_person']:
+        print("  ✓ Biometric Decision: Both voice utterances share genuine speaker identity characteristics.")
+        print(f"  ✓ Similarity score ({results['calibrated_sim']:.4f}) exceeds the verification threshold ({CALIBRATED_THRESHOLD:.4f}).")
+    else:
+        print("  ✗ Biometric Decision: The voice utterances originate from DIFFERENT human speakers.")
+        print(f"  ✗ Similarity score ({results['calibrated_sim']:.4f}) falls below verification threshold ({CALIBRATED_THRESHOLD:.4f}), triggering rejection.")
     print("=" * 90 + "\n")
 
 def main():
@@ -447,9 +473,10 @@ def main():
         print("--------------------------------------------------------------------------------")
         print("Instructions:")
         print(f"  Now record Voice 2 for {args.duration} seconds. You can test:")
-        print("    [Option A] Speak NORMALLY (test same-speaker match)")
-        print("    [Option B] SHOUT or WHISPER (test vocal effort MMSE compensation!)")
-        print("    [Option C] Have a FRIEND speak (test impostor rejection)")
+        print("    [Option A] Speak NORMALLY (test same-speaker match under normal effort)")
+        print("    [Option B] SHOUT or speak LOUDLY (test loud effort detection & MMSE compensation)")
+        print("    [Option C] WHISPER or speak SOFTLY (test soft effort detection & MMSE compensation)")
+        print("    [Option D] Have a FRIEND speak (test impostor rejection)")
         try:
             input("\nPress [ENTER] when you are ready to record Voice 2... ")
         except (EOFError, KeyboardInterrupt):

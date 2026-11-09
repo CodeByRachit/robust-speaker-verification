@@ -204,18 +204,30 @@ python3 src/live_verify.py
 ### Verification Verdict Card:
 ```
 ==========================================================================================
-                          SPEAKER VERIFICATION RESULTS
+                     BIOMETRIC & PHONATION ANALYSIS RESULTS
 ==========================================================================================
   Voice 1 (Reference) : voice1_reference.wav (5 speech windows)
   Voice 2 (Test)      : voice2_test.wav (5 speech windows)
 ------------------------------------------------------------------------------------------
+
+  [1] DETECTED VOCAL EFFORT / PHONATION MODE:
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                                                                        │
+  │   Phonation State     : LOUD / SHOUTED                                                 │
+  │   Acoustic Sound Level: +10.5 dB (3.3x relative intensity)                             │
+  │   Spectral Dynamics   : Elevated subglottal pressure and high-frequency formant shift  │
+  │   Bayesian MMSE Action: PCA-MMSE Loud Transfer Vector Subtraction                      │
+  │                                                                                        │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+
+  [2] BIOMETRIC SPEAKER VERIFICATION VERDICT:
   ┌────────────────────────────────────────────────────────────────────────────────────────┐
   │                                                                                        │
   │                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │
   │                                                                                        │
-  │   Rejection Confidence  : 71.4%                                                         │
-  │   Calibrated Score      : +0.8430  (Threshold tau = 0.8850)                 │
-  │   Margin Below Threshold: -0.0420                                                 │
+  │   Rejection Confidence  : 99.5%                                                        │
+  │   Verification Score    : -0.4265  (Threshold tau = 0.6000)                            │
+  │   Margin Below Threshold: -1.0265                                                      │
   │                                                                                        │
   └────────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -223,14 +235,16 @@ DETAILED ARCHITECTURAL COMPARISON:
 ------------------------------------------------------------------------------------------
 Pipeline Architecture                | Score      | Threshold   | Decision         | Status
 ------------------------------------------------------------------------------------------
-Image 1: Baseline (Single Window)    |     0.8819 |      0.8850 | DIFFERENT PERSON | Raw Uncentered
-Image 2: Full System (MMSE_v + DSP)  |     0.8430 |      0.8850 | DIFFERENT PERSON | Multi-Window
+Image 1: Baseline (Single Window)    |    -0.4986 |      0.6000 | DIFFERENT PERSON | Raw Uncentered
+Image 2: Full System (MMSE_v + DSP)  |    -0.4265 |      0.6000 | DIFFERENT PERSON | Multi-Window
 ------------------------------------------------------------------------------------------
 
 SCIENTIFIC EXPLANATION:
-  ✗ The voice utterances originate from DIFFERENT human speakers.
-  ✗ The similarity score (0.8430) falls below the
-    verification threshold (0.8850), triggering an impostor rejection.
+  ✓ Phonation Analysis: Test voice was classified as LOUD / SHOUTED.
+  ✓ Non-neutral phonation detected. The PCA-MMSE estimator subtracted the estimated
+    transfer vector to eliminate vocal effort distortion from speaker identity.
+  ✗ Biometric Decision: The voice utterances originate from DIFFERENT human speakers.
+  ✗ Similarity score (-0.4265) falls below verification threshold (0.6000), triggering rejection.
 ==========================================================================================
 ```
 
