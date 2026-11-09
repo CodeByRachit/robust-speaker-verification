@@ -255,13 +255,13 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.1f}x relative intensity)"
         effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
         compensation_applied = "PCA-MMSE Loud Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_cen, sim_loud_cen)
+        calibrated_sim = sim_loud_cen
     elif delta_db <= -4.0:
         effort_class = "SOFT / WHISPERED"
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.2f}x relative intensity)"
         effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
         compensation_applied = "PCA-MMSE Soft Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_cen, sim_soft_cen)
+        calibrated_sim = sim_soft_cen
     else:
         effort_class = "NORMAL / CONVERSATIONAL"
         effort_desc = f"{delta_db:+.1f} dB (Standard conversational sound level)"

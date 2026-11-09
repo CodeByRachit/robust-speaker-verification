@@ -321,19 +321,19 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
     energy_ratio = rms2 / rms1
     delta_db = float(20.0 * np.log10(energy_ratio))
 
-    # Vocal Effort Classification:
+    # Vocal Effort Classification and Transfer Vector Compensation:
     if effort_mode == "loud" or (effort_mode == "auto" and delta_db >= 5.0):
         effort_class = "LOUD / SHOUTED"
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.1f}x relative intensity)"
         effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
         compensation_applied = "PCA-MMSE Loud Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_cen, sim_loud_cen)
+        calibrated_sim = sim_loud_cen
     elif effort_mode == "soft" or (effort_mode == "auto" and delta_db <= -4.0):
         effort_class = "SOFT / WHISPERED"
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.2f}x relative intensity)"
         effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
         compensation_applied = "PCA-MMSE Soft Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_cen, sim_soft_cen)
+        calibrated_sim = sim_soft_cen
     else:
         effort_class = "NORMAL / CONVERSATIONAL"
         effort_desc = f"{delta_db:+.1f} dB (Standard conversational sound level)"
