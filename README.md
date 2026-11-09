@@ -206,16 +206,16 @@ python3 src/live_verify.py
 ==========================================================================================
                           SPEAKER VERIFICATION RESULTS
 ==========================================================================================
-  Voice 1 (Reference) : voice1_reference.wav
-  Voice 2 (Test)      : voice2_test.wav
+  Voice 1 (Reference) : voice1_reference.wav (5 speech windows)
+  Voice 2 (Test)      : voice2_test.wav (5 speech windows)
 ------------------------------------------------------------------------------------------
   ┌────────────────────────────────────────────────────────────────────────────────────────┐
   │                                                                                        │
   │                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │
   │                                                                                        │
-  │   Rejection Confidence  : 70.8%                                                        │
-  │   Calibrated Score      : +0.6123  (Threshold tau = 0.6567)                            │
-  │   Margin Below Threshold: -0.0444                                                      │
+  │   Rejection Confidence  : 71.4%                                                         │
+  │   Calibrated Score      : +0.8430  (Threshold tau = 0.8850)                 │
+  │   Margin Below Threshold: -0.0420                                                 │
   │                                                                                        │
   └────────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -223,14 +223,14 @@ DETAILED ARCHITECTURAL COMPARISON:
 ------------------------------------------------------------------------------------------
 Pipeline Architecture                | Score      | Threshold   | Decision         | Status
 ------------------------------------------------------------------------------------------
-Image 1: Baseline (E-T+WavLM)        |     0.7816 |      0.7781 | SAME PERSON      | Raw Uncentered
-Image 2: Full System (MMSE_v)        |    +0.6123 |      0.6567 | DIFFERENT PERSON | Calibrated Centered
+Image 1: Baseline (Single Window)    |     0.8819 |      0.8850 | DIFFERENT PERSON | Raw Uncentered
+Image 2: Full System (MMSE_v + DSP)  |     0.8430 |      0.8850 | DIFFERENT PERSON | Multi-Window
 ------------------------------------------------------------------------------------------
 
 SCIENTIFIC EXPLANATION:
   ✗ The voice utterances originate from DIFFERENT human speakers.
-  ✗ The calibrated similarity (+0.6123) falls significantly below the
-    verification threshold (0.6567), triggering an impostor rejection.
+  ✗ The similarity score (0.8430) falls below the
+    verification threshold (0.8850), triggering an impostor rejection.
 ==========================================================================================
 ```
 
