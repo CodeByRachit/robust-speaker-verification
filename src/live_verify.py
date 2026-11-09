@@ -315,36 +315,42 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
     emb1_template, emb1_raw, n_slices1, self_sim1 = extract_template(w1, model, device)
     emb2_template, emb2_raw, n_slices2, self_sim2 = extract_template(w2, model, device)
 
+    # Use the sharp, peak speech embedding to evaluate identity without background room-channel contamination
+    emb1_peak = emb1_raw
+    emb2_peak = emb2_raw
+
     # 1. Image 1: Raw Baseline Cosine Similarity (single-window uncompensated)
-    raw_sim = cosine_similarity(emb1_raw, emb2_raw)
+    raw_sim = cosine_similarity(emb1_peak, emb2_peak)
     raw_verdict = "SAME PERSON" if raw_sim >= RAW_THRESHOLD else "DIFFERENT PERSON"
 
-    # 2. Image 2: Centralized Multi-Window Ensemble Cosine Similarity (Equation 10, IEEE MLSP 2023)
-    sim_base_cen = centered_cosine(emb1_template, emb2_template, global_mean)
+    # 2. Image 2: Centralized Cosine Similarity in PCA-MMSE Space (Equation 10, IEEE MLSP 2023)
+    sim_base_cen = centered_cosine(emb1_peak, emb2_peak, global_mean)
 
     # MMSE Vocal Effort Compensations in Centralized Space
-    emb2_loud_comp = mmse_loud.compensate(emb2_template)
-    sim_loud_cen = centered_cosine(emb1_template, emb2_loud_comp, global_mean)
+    emb2_loud_comp = mmse_loud.compensate(emb2_peak)
+    sim_loud_cen = centered_cosine(emb1_peak, emb2_loud_comp, global_mean)
 
-    emb2_soft_comp = mmse_soft.compensate(emb2_template)
-    sim_soft_cen = centered_cosine(emb1_template, emb2_soft_comp, global_mean)
+    emb2_soft_comp = mmse_soft.compensate(emb2_peak)
+    sim_soft_cen = centered_cosine(emb1_peak, emb2_soft_comp, global_mean)
 
-    # 3. Acoustic Vocal Effort Detection from speech dynamics
+    # 3. Acoustic Vocal Effort Detection from active speech dynamics (post-VAD)
     w1_raw, _ = torchaudio.load(audio_path1)
     w2_raw, _ = torchaudio.load(audio_path2)
-    rms1 = float(torch.sqrt(torch.mean(w1_raw ** 2))) + 1e-8
-    rms2 = float(torch.sqrt(torch.mean(w2_raw ** 2))) + 1e-8
+    t1_speech = trim_silence(w1_raw)
+    t2_speech = trim_silence(w2_raw)
+    rms1 = float(torch.sqrt(torch.mean(t1_speech ** 2))) + 1e-8
+    rms2 = float(torch.sqrt(torch.mean(t2_speech ** 2))) + 1e-8
     energy_ratio = rms2 / rms1
     delta_db = float(20.0 * np.log10(energy_ratio))
 
     # Vocal Effort Classification and Transfer Vector Compensation:
-    if effort_mode == "loud" or (effort_mode == "auto" and delta_db >= 5.0):
+    if effort_mode == "loud" or (effort_mode == "auto" and delta_db >= 3.5):
         effort_class = "LOUD / SHOUTED"
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.1f}x relative intensity)"
         effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
         compensation_applied = "PCA-MMSE Loud Transfer Vector Subtraction"
         calibrated_sim = sim_loud_cen
-    elif effort_mode == "soft" or (effort_mode == "auto" and delta_db <= -4.0):
+    elif effort_mode == "soft" or (effort_mode == "auto" and delta_db <= -3.5):
         effort_class = "SOFT / WHISPERED"
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.2f}x relative intensity)"
         effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
