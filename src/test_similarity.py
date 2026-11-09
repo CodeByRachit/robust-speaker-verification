@@ -107,66 +107,72 @@ def trim_silence(waveform, sr=16000, frame_ms=30, threshold_db=25):
     end_sample = min(waveform.shape[1], (active_idx[-1] + 1) * frame_len + int(0.2 * sr))
     return waveform[:, start_sample:end_sample]
 
-def extract_template(waveform, model, device, win_sec=3.0, step_sec=0.5, max_total_sec=4.0, sr=16000):
+def extract_single_speech_slice(wav_segment, model, device, target_sec=3.0, sr=16000):
     """
-    Robust Windowed Template Extraction with Primary Speech Windowing:
-    1. Trims leading/trailing room silence and ambient hum.
-    2. Constrains evaluation to the primary continuous 4.0-second speech segment around
-       peak energy (matching the model's 4.0-second training duration and preventing
-       subsequent room noise or background talkers from corrupting the biometric template).
-    3. Extracts sliding 3-second windows with energy weighting.
+    Extracts a clean speaker embedding from an active speech segment.
+    1. Trims silence/noise using energy VAD.
+    2. Identifies continuous 3.0-second speech window with highest acoustic energy.
+    3. Passes isolated speech through WavLM + ECAPA-TDNN to extract 256-dim embedding.
     """
-    trimmed = trim_silence(waveform, sr=sr)
-    max_len = int(max_total_sec * sr)
-    win = int(win_sec * sr)
-    step = int(step_sec * sr)
-
-    # If speech exceeds 4.0 seconds, isolate the primary speech segment around peak energy
-    if trimmed.shape[1] > max_len:
+    trimmed = trim_silence(wav_segment, sr=sr)
+    target_len = int(target_sec * sr)
+    if trimmed.shape[1] > target_len:
         best_start = 0
         max_energy = -1.0
-        for s in range(0, trimmed.shape[1] - max_len + 1, int(0.25 * sr)):
-            chunk = trimmed[:, s:s+max_len]
+        step = int(0.1 * sr)
+        for s in range(0, trimmed.shape[1] - target_len + 1, step):
+            chunk = trimmed[:, s:s+target_len]
             e = float(torch.sum(chunk**2))
             if e > max_energy:
                 max_energy = e
                 best_start = s
-        trimmed = trimmed[:, best_start:best_start+max_len]
-
-    slices = []
-    weights = []
-    if trimmed.shape[1] <= win:
-        pad = win - trimmed.shape[1]
-        sl = torch.nn.functional.pad(trimmed, (0, pad))
-        slices.append(sl)
-        weights.append(1.0)
+        speech_chunk = trimmed[:, best_start:best_start+target_len]
     else:
-        for s in range(0, trimmed.shape[1] - win + 1, step):
-            sl = trimmed[:, s:s+win]
-            rms = float(torch.sqrt(torch.mean(sl**2)))
-            slices.append(sl)
-            weights.append(rms)
-
-    weights = np.array(weights)
-    weights = weights / (np.sum(weights) + 1e-9)
+        pad = target_len - trimmed.shape[1]
+        speech_chunk = torch.nn.functional.pad(trimmed, (0, pad))
 
     with torch.no_grad():
-        embs = [model(s.to(device)).cpu().numpy().flatten() for s in slices]
+        emb = model(speech_chunk.to(device)).cpu().numpy().flatten()
+    rms = float(torch.sqrt(torch.mean(speech_chunk**2))) + 1e-8
+    return emb, speech_chunk, rms
 
-    # Energy-weighted ensemble template
-    weighted_template = np.sum([w * e for w, e in zip(weights, embs)], axis=0)
+def extract_dual_speech_embeddings(waveform, model, device, target_sec=3.0, sr=16000):
+    """
+    Dual-Window Speech Decomposition:
+    Breaks a 10-second recording into two distinct temporal halves (early & late)
+    and extracts peak biometric embeddings for each half to run a 2-pass verification check.
+    """
+    total_samples = waveform.shape[1]
+    total_sec = total_samples / sr
 
-    # Pick the most energetic speech slice for the Image 1 Baseline
-    best_slice_idx = int(np.argmax(weights))
-    best_raw_emb = embs[best_slice_idx]
-
-    if len(embs) > 1:
-        self_sims = [cosine_similarity(embs[i], embs[j]) for i in range(len(embs)) for j in range(i+1, len(embs))]
-        self_sim = float(np.mean(self_sims))
+    if total_sec >= 7.0:
+        # 10-second recording: break into Window 1 (first 5.5s) and Window 2 (last 5.5s)
+        mid_sample = total_samples // 2
+        overlap = int(0.5 * sr)
+        seg1 = waveform[:, :min(total_samples, mid_sample + overlap)]
+        seg2 = waveform[:, max(0, mid_sample - overlap):]
     else:
-        self_sim = 1.0
+        # Shorter recording (<7s): break into early 65% and late 65% overlapping halves
+        len1 = int(total_samples * 0.65)
+        start2 = int(total_samples * 0.35)
+        seg1 = waveform[:, :len1]
+        seg2 = waveform[:, start2:]
 
-    return weighted_template, best_raw_emb, len(slices), self_sim
+    emb1, chunk1, rms1 = extract_single_speech_slice(seg1, model, device, target_sec=target_sec, sr=sr)
+    emb2, chunk2, rms2 = extract_single_speech_slice(seg2, model, device, target_sec=target_sec, sr=sr)
+
+    # Intra-utterance self-consistency across the two halves
+    self_sim = cosine_similarity(emb1, emb2)
+
+    return (emb1, rms1), (emb2, rms2), self_sim
+
+def extract_template(waveform, model, device, win_sec=3.0, step_sec=0.5, max_total_sec=4.0, sr=16000):
+    """
+    Extracts speech embeddings from dual temporal windows with peak speech selection.
+    """
+    (e1, r1), (e2, r2), self_sim = extract_dual_speech_embeddings(waveform, model, device, target_sec=win_sec, sr=sr)
+    mean_emb = (e1 + e2) / 2.0
+    return mean_emb, e1, 2, self_sim
 
 def scan_dataset(data_dir):
     raw_files = glob.glob(os.path.join(data_dir, "**", "*.wav"), recursive=True)
@@ -234,8 +240,11 @@ def get_mmse_cache(model, device, catalog):
 
 def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, global_mean):
     print("\n" + "=" * 90)
-    print("                     BIOMETRIC & PHONATION ANALYSIS RESULTS")
+    print("         BIOMETRIC & PHONATION ANALYSIS RESULTS (10s DUAL-PASS CHECK)")
     print("=" * 90)
+
+    v1_name = os.path.basename(path1)
+    v2_name = os.path.basename(path2)
     print(f"  Voice 1 (Reference) : {path1}")
     print(f"  Voice 2 (Test)      : {path2}")
     print("-" * 90)
@@ -243,73 +252,92 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
     w1 = preprocess_audio(path1)
     w2 = preprocess_audio(path2)
 
-    t1, raw_e1, n1, self_sim1 = extract_template(w1, model, device)
-    t2, raw_e2, n2, self_sim2 = extract_template(w2, model, device)
+    (emb1_1, rms1_1), (emb1_2, rms1_2), self_sim1 = extract_dual_speech_embeddings(w1, model, device)
+    (emb2_1, rms2_1), (emb2_2, rms2_2), self_sim2 = extract_dual_speech_embeddings(w2, model, device)
 
-    # Use the sharp, peak speech embedding to evaluate identity without background room-channel contamination
-    emb1_peak = raw_e1
-    emb2_peak = raw_e2
+    def evaluate_pass(e1, r1, e2, r2):
+        raw_sim = cosine_similarity(e1, e2)
+        raw_verdict = "SAME PERSON" if raw_sim >= RAW_THRESHOLD else "DIFFERENT PERSON"
 
-    raw_sim = cosine_similarity(emb1_peak, emb2_peak)
-    raw_verdict = "SAME PERSON" if raw_sim >= RAW_THRESHOLD else "DIFFERENT PERSON"
+        sim_base_cen = centered_cosine(e1, e2, global_mean)
+        e2_loud = mmse_loud.compensate(e2)
+        sim_loud_cen = centered_cosine(e1, e2_loud, global_mean)
+        e2_soft = mmse_soft.compensate(e2)
+        sim_soft_cen = centered_cosine(e1, e2_soft, global_mean)
 
-    # Centralized Cosine Similarity in PCA-MMSE Space (Equation 10, IEEE MLSP 2023)
-    sim_base_cen = centered_cosine(emb1_peak, emb2_peak, global_mean)
+        ratio = r2 / (r1 + 1e-8)
+        delta_db = float(20.0 * np.log10(ratio)) if ratio > 0 else 0.0
 
-    t2_loud_comp = mmse_loud.compensate(emb2_peak)
-    sim_loud_cen = centered_cosine(emb1_peak, t2_loud_comp, global_mean)
+        if delta_db >= 3.5:
+            effort_class = "LOUD / SHOUTED"
+            effort_desc = f"{delta_db:+.1f} dB ({ratio:.1f}x relative intensity)"
+            effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
+            compensation = "PCA-MMSE Loud Transfer Vector Subtraction"
+            cal_sim = sim_loud_cen
+        elif delta_db <= -3.5:
+            effort_class = "SOFT / WHISPERED"
+            effort_desc = f"{delta_db:+.1f} dB ({ratio:.2f}x relative intensity)"
+            effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
+            compensation = "PCA-MMSE Soft Transfer Vector Subtraction"
+            cal_sim = sim_soft_cen
+        else:
+            effort_class = "NORMAL / CONVERSATIONAL"
+            effort_desc = f"{delta_db:+.1f} dB (Standard conversational sound level)"
+            effort_acoustic = "Modal phonation with balanced glottal harmonic decay"
+            compensation = "None (Neutral Phonation Baseline)"
+            cal_sim = sim_base_cen
 
-    t2_soft_comp = mmse_soft.compensate(emb2_peak)
-    sim_soft_cen = centered_cosine(emb1_peak, t2_soft_comp, global_mean)
+        is_same = (cal_sim >= CALIBRATED_THRESHOLD)
+        verdict = "SAME PERSON" if is_same else "DIFFERENT PERSON"
+        return {
+            'raw_sim': raw_sim,
+            'raw_verdict': raw_verdict,
+            'cal_sim': cal_sim,
+            'is_same': is_same,
+            'verdict': verdict,
+            'effort_class': effort_class,
+            'effort_desc': effort_desc,
+            'effort_acoustic': effort_acoustic,
+            'compensation': compensation,
+            'delta_db': delta_db
+        }
 
-    # Acoustic Vocal Effort Detection from active speech dynamics (post-VAD)
-    w1_raw, _ = torchaudio.load(path1)
-    w2_raw, _ = torchaudio.load(path2)
-    t1_speech = trim_silence(w1_raw)
-    t2_speech = trim_silence(w2_raw)
-    rms1 = float(torch.sqrt(torch.mean(t1_speech ** 2))) + 1e-8
-    rms2 = float(torch.sqrt(torch.mean(t2_speech ** 2))) + 1e-8
-    energy_ratio = rms2 / rms1
-    delta_db = float(20.0 * np.log10(energy_ratio))
+    pass1 = evaluate_pass(emb1_1, rms1_1, emb2_1, rms2_1)
+    pass2 = evaluate_pass(emb1_2, rms1_2, emb2_2, rms2_2)
 
-    if delta_db >= 3.5:
-        effort_class = "LOUD / SHOUTED"
-        effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.1f}x relative intensity)"
-        effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
-        compensation_applied = "PCA-MMSE Loud Transfer Vector Subtraction"
-        calibrated_sim = sim_loud_cen
-    elif delta_db <= -3.5:
-        effort_class = "SOFT / WHISPERED"
-        effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.2f}x relative intensity)"
-        effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
-        compensation_applied = "PCA-MMSE Soft Transfer Vector Subtraction"
-        calibrated_sim = sim_soft_cen
+    combined_cal_sim = (pass1['cal_sim'] + pass2['cal_sim']) / 2.0
+    combined_raw_sim = (pass1['raw_sim'] + pass2['raw_sim']) / 2.0
+
+    cross_1 = centered_cosine(emb1_1, emb2_2, global_mean)
+    cross_2 = centered_cosine(emb1_2, emb2_1, global_mean)
+    cross_avg = (cross_1 + cross_2) / 2.0
+
+    if pass1['is_same'] and pass2['is_same']:
+        is_same_person = True
+        consensus_verdict = "SAME PERSON (MATCH - CONFIRMED BY BOTH PASSES)"
+    elif (not pass1['is_same']) and (not pass2['is_same']):
+        is_same_person = False
+        consensus_verdict = "DIFFERENT PERSON (IMPOSTOR - REJECTED BY BOTH PASSES)"
     else:
-        effort_class = "NORMAL / CONVERSATIONAL"
-        effort_desc = f"{delta_db:+.1f} dB (Standard conversational sound level)"
-        effort_acoustic = "Modal phonation with balanced glottal harmonic decay"
-        compensation_applied = "None (Neutral Phonation Baseline)"
-        calibrated_sim = sim_base_cen
+        is_same_person = False
+        consensus_verdict = "DIFFERENT PERSON (REJECTED - INCONSISTENT PASSES)"
 
-    is_same = (calibrated_sim >= CALIBRATED_THRESHOLD)
-    verdict = "SAME PERSON (MATCH)" if is_same else "DIFFERENT PERSON (IMPOSTOR)"
-
-    if is_same:
-        margin = calibrated_sim - CALIBRATED_THRESHOLD
+    if is_same_person:
+        margin = combined_cal_sim - CALIBRATED_THRESHOLD
         conf = 70.0 + min(29.5, (margin / (1.0 - CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
     else:
-        margin = CALIBRATED_THRESHOLD - calibrated_sim
+        margin = CALIBRATED_THRESHOLD - combined_cal_sim
         conf = 70.0 + min(29.5, (margin / (CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
 
     # [1] Phonation Box
-    print("\n  [1] DETECTED VOCAL EFFORT / PHONATION MODE:")
+    print("\n  [1] DETECTED VOCAL EFFORT / PHONATION MODE (DUAL-WINDOW):")
     effort_box = [
         "┌────────────────────────────────────────────────────────────────────────────────────────┐",
         "│                                                                                        │",
-        f"│   Phonation State     : {effort_class:<55} │",
-        f"│   Acoustic Sound Level: {effort_desc:<55} │",
-        f"│   Spectral Dynamics   : {effort_acoustic:<55} │",
-        f"│   Bayesian MMSE Action: {compensation_applied:<55} │",
+        f"│   Window 1 (Early)    : {pass1['effort_class']:<26} Acoustic: {pass1['effort_desc']:<23} │",
+        f"│   Window 2 (Late)     : {pass2['effort_class']:<26} Acoustic: {pass2['effort_desc']:<23} │",
+        f"│   Spectral Dynamics   : {pass1['effort_acoustic']:<55} │",
+        f"│   Bayesian MMSE Action: {pass1['compensation']:<55} │",
         "│                                                                                        │",
         "└────────────────────────────────────────────────────────────────────────────────────────┘"
     ]
@@ -317,16 +345,21 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
         print("  " + line)
 
     # [2] Biometric Verdict Box
-    print("\n  [2] BIOMETRIC SPEAKER VERIFICATION VERDICT:")
-    if is_same:
+    print("\n  [2] BIOMETRIC SPEAKER VERIFICATION VERDICT (CHECKED TWO TIMES ACROSS 10s):")
+    verdict_tag = f">>> FINAL VERDICT: {consensus_verdict} <<<"
+    if len(verdict_tag) > 82:
+        verdict_tag = verdict_tag[:82]
+
+    if is_same_person:
         status_box = [
             "┌────────────────────────────────────────────────────────────────────────────────────────┐",
             "│                                                                                        │",
-            "│                      >>> FINAL VERDICT: SAME PERSON (MATCH) <<<                        │",
+            f"│   {verdict_tag:^84} │",
             "│                                                                                        │",
             f"│   Biometric Confidence  : {conf:.1f}%                                                         │",
-            f"│   Calibrated Score      : {calibrated_sim:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
-            f"│   Margin Above Threshold: {calibrated_sim - CALIBRATED_THRESHOLD:+.4f}                                                 │",
+            f"│   Check 1 (Early 0-5s)  : {pass1['cal_sim']:+.4f}  [{pass1['verdict']:<16}] (Threshold tau = {CALIBRATED_THRESHOLD:.4f})  │",
+            f"│   Check 2 (Late 5-10s)  : {pass2['cal_sim']:+.4f}  [{pass2['verdict']:<16}] (Threshold tau = {CALIBRATED_THRESHOLD:.4f})  │",
+            f"│   Dual-Check Mean Score : {combined_cal_sim:+.4f}  (Margin Above: {combined_cal_sim - CALIBRATED_THRESHOLD:+.4f})                       │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
         ]
@@ -334,23 +367,24 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
         status_box = [
             "┌────────────────────────────────────────────────────────────────────────────────────────┐",
             "│                                                                                        │",
-            "│                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │",
+            f"│   {verdict_tag:^84} │",
             "│                                                                                        │",
             f"│   Rejection Confidence  : {conf:.1f}%                                                         │",
-            f"│   Calibrated Score      : {calibrated_sim:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
-            f"│   Margin Below Threshold: {calibrated_sim - CALIBRATED_THRESHOLD:+.4f}                                                 │",
+            f"│   Check 1 (Early 0-5s)  : {pass1['cal_sim']:+.4f}  [{pass1['verdict']:<16}] (Threshold tau = {CALIBRATED_THRESHOLD:.4f})  │",
+            f"│   Check 2 (Late 5-10s)  : {pass2['cal_sim']:+.4f}  [{pass2['verdict']:<16}] (Threshold tau = {CALIBRATED_THRESHOLD:.4f})  │",
+            f"│   Dual-Check Mean Score : {combined_cal_sim:+.4f}  (Margin Below: {combined_cal_sim - CALIBRATED_THRESHOLD:+.4f})                       │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
         ]
     for line in status_box:
         print("  " + line)
 
-    print("\nDETAILED ARCHITECTURAL COMPARISON:")
+    print("\nDETAILED ARCHITECTURAL COMPARISON (2-PASS VALIDATION):")
     print("-" * 90)
-    print(f"{'Pipeline Architecture':<36} | {'Similarity':<12} | {'Threshold':<11} | {'Decision'}")
+    print(f"{'Pipeline Architecture':<30} | {'Pass 1 (0-5s)':<14} | {'Pass 2 (5-10s)':<14} | {'Consensus':<11} | {'Decision'}")
     print("-" * 90)
-    print(f"{'Image 1: Baseline (E-T+WavLM)':<36} | {raw_sim:>12.4f} | {RAW_THRESHOLD:>11.4f} | {raw_verdict}")
-    print(f"{'Image 2: Full System (MMSE_v)':<36} | {calibrated_sim:>+12.4f} | {CALIBRATED_THRESHOLD:>11.4f} | {verdict}")
+    print(f"{'Image 1: Baseline (E-T+WavLM)':<30} | {pass1['raw_sim']:>14.4f} | {pass2['raw_sim']:>14.4f} | {combined_raw_sim:>11.4f} | {'SAME PERSON' if combined_raw_sim >= RAW_THRESHOLD else 'DIFFERENT PERSON'}")
+    print(f"{'Image 2: Full System (MMSE_v)':<30} | {pass1['cal_sim']:>+14.4f} | {pass2['cal_sim']:>+14.4f} | {combined_cal_sim:>+11.4f} | {'SAME PERSON' if is_same_person else 'DIFFERENT PERSON'}")
     print("=" * 90 + "\n")
 
 def test_model(checkpoint_path, data_dir, device=None, voice1=None, voice2=None):
