@@ -28,8 +28,9 @@ AVID_DIR = os.path.join(BASE_DIR, "AVID", "AVID")
 RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 CACHE_FILE = os.path.join(BASE_DIR, "checkpoint_mmse_cache.pkl")
 
-# Nominal decision threshold for live microphone verification
-DEFAULT_THRESHOLD = 0.8700
+# Equal Error Rate (EER) thresholds from IEEE MLSP 2023 paper benchmark
+RAW_THRESHOLD = 0.7781
+CALIBRATED_THRESHOLD = 0.6567
 
 def cosine_similarity(v1, v2):
     dot = np.dot(v1, v2)
@@ -38,6 +39,21 @@ def cosine_similarity(v1, v2):
     if n1 == 0 or n2 == 0:
         return 0.0
     return float(dot / (n1 * n2))
+
+def centered_cosine(v1, v2, global_mean):
+    """
+    Centralized Cosine Similarity (Equation 10, IEEE MLSP 2023):
+    Subtracts the global background speech center (global_mean) to cancel the
+    shared directional bias across speaker embeddings before computing the
+    inner product, separating genuine speakers from impostors.
+    """
+    c1 = v1 - global_mean
+    c2 = v2 - global_mean
+    n1 = np.linalg.norm(c1)
+    n2 = np.linalg.norm(c2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return float(np.dot(c1, c2) / (n1 * n2))
 
 def preprocess_audio(path, sample_rate=16000):
     """
@@ -245,23 +261,19 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
     emb1_template, emb1_raw, n_slices1, self_sim1 = extract_template(w1, model, device)
     emb2_template, emb2_raw, n_slices2, self_sim2 = extract_template(w2, model, device)
 
-    # Dynamic threshold calibrated to the enrollment voice's intra-speaker consistency
-    # Genuine speakers score within self_sim1 ± 0.05, while impostors drop below 0.86
-    threshold = float(min(0.8800, max(0.8600, self_sim1 - 0.065)))
-
     # 1. Image 1: Raw Baseline Cosine Similarity (single-window uncompensated)
     raw_sim = cosine_similarity(emb1_raw, emb2_raw)
-    raw_verdict = "SAME PERSON" if raw_sim >= threshold else "DIFFERENT PERSON"
+    raw_verdict = "SAME PERSON" if raw_sim >= RAW_THRESHOLD else "DIFFERENT PERSON"
 
-    # 2. Image 2: Multi-Window Ensemble Cosine Similarity
-    sim_base_template = cosine_similarity(emb1_template, emb2_template)
+    # 2. Image 2: Centralized Multi-Window Ensemble Cosine Similarity (Equation 10, IEEE MLSP 2023)
+    sim_base_cen = centered_cosine(emb1_template, emb2_template, global_mean)
 
-    # MMSE Vocal Effort Compensations
+    # MMSE Vocal Effort Compensations in Centralized Space
     emb2_loud_comp = mmse_loud.compensate(emb2_template)
-    sim_loud = cosine_similarity(emb1_template, emb2_loud_comp)
+    sim_loud_cen = centered_cosine(emb1_template, emb2_loud_comp, global_mean)
 
     emb2_soft_comp = mmse_soft.compensate(emb2_template)
-    sim_soft = cosine_similarity(emb1_template, emb2_soft_comp)
+    sim_soft_cen = centered_cosine(emb1_template, emb2_soft_comp, global_mean)
 
     # 3. Acoustic Vocal Effort Detection from speech dynamics
     w1_raw, _ = torchaudio.load(audio_path1)
@@ -277,39 +289,40 @@ def run_verification(audio_path1, audio_path2, model, device, mmse_loud, mmse_so
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.1f}x relative intensity)"
         effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
         compensation_applied = "PCA-MMSE Loud Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_template, sim_loud)
+        calibrated_sim = max(sim_base_cen, sim_loud_cen)
     elif effort_mode == "soft" or (effort_mode == "auto" and delta_db <= -4.0):
         effort_class = "SOFT / WHISPERED"
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.2f}x relative intensity)"
         effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
         compensation_applied = "PCA-MMSE Soft Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_template, sim_soft)
+        calibrated_sim = max(sim_base_cen, sim_soft_cen)
     else:
         effort_class = "NORMAL / CONVERSATIONAL"
         effort_desc = f"{delta_db:+.1f} dB (Standard conversational sound level)"
         effort_acoustic = "Modal phonation with balanced glottal harmonic decay"
         compensation_applied = "None (Neutral Phonation Baseline)"
-        calibrated_sim = sim_base_template
+        calibrated_sim = sim_base_cen
 
-    is_same_person = (calibrated_sim >= threshold)
+    is_same_person = (calibrated_sim >= CALIBRATED_THRESHOLD)
     calibrated_verdict = "SAME PERSON" if is_same_person else "DIFFERENT PERSON"
 
     # Confidence calculation based on margin to decision threshold
     if is_same_person:
-        margin = calibrated_sim - threshold
-        conf = 70.0 + min(29.5, (margin / (1.0 - threshold + 1e-6)) * 30.0)
+        margin = calibrated_sim - CALIBRATED_THRESHOLD
+        conf = 70.0 + min(29.5, (margin / (1.0 - CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
     else:
-        margin = threshold - calibrated_sim
-        conf = 70.0 + min(29.5, (margin / (threshold + 1e-6)) * 30.0)
+        margin = CALIBRATED_THRESHOLD - calibrated_sim
+        conf = 70.0 + min(29.5, (margin / (CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
 
     return {
         'raw_sim': raw_sim,
         'raw_verdict': raw_verdict,
-        'sim_base_cen': sim_base_template,
-        'sim_loud_cen': sim_loud,
-        'sim_soft_cen': sim_soft,
+        'raw_threshold': RAW_THRESHOLD,
+        'sim_base_cen': sim_base_cen,
+        'sim_loud_cen': sim_loud_cen,
+        'sim_soft_cen': sim_soft_cen,
         'calibrated_sim': calibrated_sim,
-        'threshold': threshold,
+        'threshold': CALIBRATED_THRESHOLD,
         'self_sim1': self_sim1,
         'is_same_person': is_same_person,
         'calibrated_verdict': calibrated_verdict,
@@ -360,7 +373,7 @@ def print_result_card(results, path1, path2):
             "│                      >>> FINAL VERDICT: SAME PERSON (MATCH) <<<                        │",
             "│                                                                                        │",
             f"│   Biometric Confidence  : {results['confidence']:.1f}%                                                         │",
-            f"│   Verification Score    : {results['calibrated_sim']:+.4f}  (Threshold tau = {threshold:.4f})                 │",
+            f"│   Calibrated Score      : {results['calibrated_sim']:+.4f}  (Threshold tau = {threshold:.4f})                 │",
             f"│   Margin Above Threshold: {results['calibrated_sim'] - threshold:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
@@ -372,7 +385,7 @@ def print_result_card(results, path1, path2):
             "│                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │",
             "│                                                                                        │",
             f"│   Rejection Confidence  : {results['confidence']:.1f}%                                                         │",
-            f"│   Verification Score    : {results['calibrated_sim']:+.4f}  (Threshold tau = {threshold:.4f})                 │",
+            f"│   Calibrated Score      : {results['calibrated_sim']:+.4f}  (Threshold tau = {threshold:.4f})                 │",
             f"│   Margin Below Threshold: {results['calibrated_sim'] - threshold:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
@@ -385,8 +398,8 @@ def print_result_card(results, path1, path2):
     print("-" * 90)
     print(f"{'Pipeline Architecture':<36} | {'Score':<10} | {'Threshold':<11} | {'Decision':<16} | {'Status'}")
     print("-" * 90)
-    print(f"{'Image 1: Baseline (Single Window)':<36} | {results['raw_sim']:>10.4f} | {threshold:>11.4f} | {results['raw_verdict']:<16} | {'Raw Uncentered'}")
-    print(f"{'Image 2: Full System (MMSE_v + DSP)':<36} | {results['calibrated_sim']:>10.4f} | {threshold:>11.4f} | {results['calibrated_verdict']:<16} | {'Multi-Window'}")
+    print(f"{'Image 1: Baseline (E-T+WavLM)':<36} | {results['raw_sim']:>10.4f} | {results['raw_threshold']:>11.4f} | {results['raw_verdict']:<16} | {'Raw Uncentered'}")
+    print(f"{'Image 2: Full System (MMSE_v)':<36} | {results['calibrated_sim']:>+10.4f} | {threshold:>11.4f} | {results['calibrated_verdict']:<16} | {'Calibrated Centered'}")
     print("-" * 90)
 
     print("\nSCIENTIFIC EXPLANATION:")
@@ -399,10 +412,10 @@ def print_result_card(results, path1, path2):
 
     if results['is_same_person']:
         print("  ✓ Biometric Decision: Both voice utterances share genuine speaker identity characteristics.")
-        print(f"  ✓ Similarity score ({results['calibrated_sim']:.4f}) exceeds the verification threshold ({threshold:.4f}).")
+        print(f"  ✓ Calibrated similarity score ({results['calibrated_sim']:+.4f}) exceeds the verification threshold ({threshold:.4f}).")
     else:
         print("  ✗ Biometric Decision: The voice utterances originate from DIFFERENT human speakers.")
-        print(f"  ✗ Similarity score ({results['calibrated_sim']:.4f}) falls below verification threshold ({threshold:.4f}), triggering rejection.")
+        print(f"  ✗ Calibrated similarity score ({results['calibrated_sim']:+.4f}) falls below verification threshold ({threshold:.4f}), triggering rejection.")
     print("=" * 90 + "\n")
 
 def main():

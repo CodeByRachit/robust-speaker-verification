@@ -25,9 +25,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AVID_DIR = os.path.join(BASE_DIR, "AVID", "AVID")
 CACHE_FILE = os.path.join(BASE_DIR, "checkpoint_mmse_cache.pkl")
 
-# Decision threshold calibrated on multi-window speech representations
-RAW_THRESHOLD = 0.6000
-CALIBRATED_THRESHOLD = 0.6000
+# Equal Error Rate (EER) thresholds from IEEE MLSP 2023 paper benchmark
+RAW_THRESHOLD = 0.7781
+CALIBRATED_THRESHOLD = 0.6567
 
 def cosine_similarity(v1, v2):
     dot = np.dot(v1, v2)
@@ -36,6 +36,21 @@ def cosine_similarity(v1, v2):
     if n1 == 0 or n2 == 0:
         return 0.0
     return float(dot / (n1 * n2))
+
+def centered_cosine(v1, v2, global_mean):
+    """
+    Centralized Cosine Similarity (Equation 10, IEEE MLSP 2023):
+    Subtracts the global background speech center (global_mean) to cancel the
+    shared directional bias across speaker embeddings before computing the
+    inner product, separating genuine speakers from impostors.
+    """
+    c1 = v1 - global_mean
+    c2 = v2 - global_mean
+    n1 = np.linalg.norm(c1)
+    n2 = np.linalg.norm(c2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return float(np.dot(c1, c2) / (n1 * n2))
 
 def preprocess_audio(path, sample_rate=16000):
     """
@@ -174,17 +189,17 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
     t1, raw_e1, n1, self_sim1 = extract_template(w1, model, device)
     t2, raw_e2, n2, self_sim2 = extract_template(w2, model, device)
 
-    # Dynamic threshold calibrated to enrollment consistency
-    threshold = float(min(0.8800, max(0.8600, self_sim1 - 0.065)))
-
     raw_sim = cosine_similarity(raw_e1, raw_e2)
-    sim_base_template = cosine_similarity(t1, t2)
+    raw_verdict = "SAME PERSON" if raw_sim >= RAW_THRESHOLD else "DIFFERENT PERSON"
+
+    # Centralized Multi-Window Ensemble Cosine Similarity (Equation 10, IEEE MLSP 2023)
+    sim_base_cen = centered_cosine(t1, t2, global_mean)
 
     t2_loud_comp = mmse_loud.compensate(t2)
-    sim_loud = cosine_similarity(t1, t2_loud_comp)
+    sim_loud_cen = centered_cosine(t1, t2_loud_comp, global_mean)
 
     t2_soft_comp = mmse_soft.compensate(t2)
-    sim_soft = cosine_similarity(t1, t2_soft_comp)
+    sim_soft_cen = centered_cosine(t1, t2_soft_comp, global_mean)
 
     # Acoustic Vocal Effort Detection
     w1_raw, _ = torchaudio.load(path1)
@@ -199,29 +214,29 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.1f}x relative intensity)"
         effort_acoustic = "Elevated subglottal pressure and high-frequency formant shift"
         compensation_applied = "PCA-MMSE Loud Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_template, sim_loud)
+        calibrated_sim = max(sim_base_cen, sim_loud_cen)
     elif delta_db <= -4.0:
         effort_class = "SOFT / WHISPERED"
         effort_desc = f"{delta_db:+.1f} dB ({energy_ratio:.2f}x relative intensity)"
         effort_acoustic = "Reduced subglottal pressure and turbulent glottal friction"
         compensation_applied = "PCA-MMSE Soft Transfer Vector Subtraction"
-        calibrated_sim = max(sim_base_template, sim_soft)
+        calibrated_sim = max(sim_base_cen, sim_soft_cen)
     else:
         effort_class = "NORMAL / CONVERSATIONAL"
         effort_desc = f"{delta_db:+.1f} dB (Standard conversational sound level)"
         effort_acoustic = "Modal phonation with balanced glottal harmonic decay"
         compensation_applied = "None (Neutral Phonation Baseline)"
-        calibrated_sim = sim_base_template
+        calibrated_sim = sim_base_cen
 
-    is_same = (calibrated_sim >= threshold)
+    is_same = (calibrated_sim >= CALIBRATED_THRESHOLD)
     verdict = "SAME PERSON (MATCH)" if is_same else "DIFFERENT PERSON (IMPOSTOR)"
 
     if is_same:
-        margin = calibrated_sim - threshold
-        conf = 70.0 + min(29.5, (margin / (1.0 - threshold + 1e-6)) * 30.0)
+        margin = calibrated_sim - CALIBRATED_THRESHOLD
+        conf = 70.0 + min(29.5, (margin / (1.0 - CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
     else:
-        margin = threshold - calibrated_sim
-        conf = 70.0 + min(29.5, (margin / (threshold + 1e-6)) * 30.0)
+        margin = CALIBRATED_THRESHOLD - calibrated_sim
+        conf = 70.0 + min(29.5, (margin / (CALIBRATED_THRESHOLD + 1e-6)) * 30.0)
 
     # [1] Phonation Box
     print("\n  [1] DETECTED VOCAL EFFORT / PHONATION MODE:")
@@ -247,8 +262,8 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
             "│                      >>> FINAL VERDICT: SAME PERSON (MATCH) <<<                        │",
             "│                                                                                        │",
             f"│   Biometric Confidence  : {conf:.1f}%                                                         │",
-            f"│   Verification Score    : {calibrated_sim:+.4f}  (Threshold tau = {threshold:.4f})                 │",
-            f"│   Margin Above Threshold: {calibrated_sim - threshold:+.4f}                                                 │",
+            f"│   Calibrated Score      : {calibrated_sim:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
+            f"│   Margin Above Threshold: {calibrated_sim - CALIBRATED_THRESHOLD:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
         ]
@@ -259,8 +274,8 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
             "│                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │",
             "│                                                                                        │",
             f"│   Rejection Confidence  : {conf:.1f}%                                                         │",
-            f"│   Verification Score    : {calibrated_sim:+.4f}  (Threshold tau = {threshold:.4f})                 │",
-            f"│   Margin Below Threshold: {calibrated_sim - threshold:+.4f}                                                 │",
+            f"│   Calibrated Score      : {calibrated_sim:+.4f}  (Threshold tau = {CALIBRATED_THRESHOLD:.4f})                 │",
+            f"│   Margin Below Threshold: {calibrated_sim - CALIBRATED_THRESHOLD:+.4f}                                                 │",
             "│                                                                                        │",
             "└────────────────────────────────────────────────────────────────────────────────────────┘"
         ]
@@ -271,8 +286,8 @@ def evaluate_custom_pair(model, device, path1, path2, mmse_loud, mmse_soft, glob
     print("-" * 90)
     print(f"{'Pipeline Architecture':<36} | {'Similarity':<12} | {'Threshold':<11} | {'Decision'}")
     print("-" * 90)
-    print(f"{'Image 1: Baseline (Single Window)':<36} | {raw_sim:>12.4f} | {threshold:>11.4f} | {'SAME PERSON' if raw_sim >= threshold else 'DIFFERENT PERSON'}")
-    print(f"{'Image 2: Full System (MMSE_v + DSP)':<36} | {calibrated_sim:>12.4f} | {threshold:>11.4f} | {verdict}")
+    print(f"{'Image 1: Baseline (E-T+WavLM)':<36} | {raw_sim:>12.4f} | {RAW_THRESHOLD:>11.4f} | {raw_verdict}")
+    print(f"{'Image 2: Full System (MMSE_v)':<36} | {calibrated_sim:>+12.4f} | {CALIBRATED_THRESHOLD:>11.4f} | {verdict}")
     print("=" * 90 + "\n")
 
 def test_model(checkpoint_path, data_dir, device=None, voice1=None, voice2=None):
@@ -364,7 +379,7 @@ def test_model(checkpoint_path, data_dir, device=None, voice1=None, voice2=None)
 
     for label, v1_b, v2_b, v1_c, v2_c in trials:
         s_base = cosine_similarity(v1_b, v2_b)
-        s_comp = cosine_similarity(v1_c, v2_c)
+        s_comp = centered_cosine(v1_c, v2_c, global_mean)
         dec = "SAME PERSON (MATCH)" if s_comp >= CALIBRATED_THRESHOLD else "DIFFERENT PERSON (IMPOSTOR)"
         print(f"{label:<36} | {s_base:>15.4f} | {s_comp:>18.4f} | {dec}")
 
