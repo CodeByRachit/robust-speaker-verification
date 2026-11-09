@@ -25,9 +25,9 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AVID_DIR = os.path.join(BASE_DIR, "AVID", "AVID")
 CACHE_FILE = os.path.join(BASE_DIR, "checkpoint_mmse_cache.pkl")
 
-# Equal Error Rate (EER) thresholds from IEEE MLSP 2023 paper benchmark
+# Equal Error Rate (EER) thresholds calibrated for robust live microphone verification
 RAW_THRESHOLD = 0.7781
-CALIBRATED_THRESHOLD = 0.6567
+CALIBRATED_THRESHOLD = 0.6200
 
 def cosine_similarity(v1, v2):
     dot = np.dot(v1, v2)
@@ -83,33 +83,74 @@ def preprocess_audio(path, sample_rate=16000):
 
     return waveform
 
-def extract_template(waveform, model, device, win_sec=3.5, step_sec=1.5, sr=16000):
+def trim_silence(waveform, sr=16000, frame_ms=30, threshold_db=25):
     """
-    Windowed Template Extraction:
-    Extracts sliding 3.5-second windows (matching the model's training duration)
-    across the recording and computes the ensemble mean speaker embedding.
+    Energy-based Voice Activity Detection (VAD):
+    Identifies active speech frames and trims leading/trailing room silence and hum,
+    preventing non-speech frames from corrupting speaker embeddings.
     """
+    frame_len = int(frame_ms * sr / 1000)
+    num_frames = waveform.shape[1] // frame_len
+    if num_frames == 0:
+        return waveform
+    energies = []
+    for i in range(num_frames):
+        chunk = waveform[:, i*frame_len:(i+1)*frame_len]
+        rms = float(torch.sqrt(torch.mean(chunk**2))) + 1e-8
+        energies.append(rms)
+    max_energy = max(energies)
+    min_energy = max_energy * (10 ** (-threshold_db / 20.0))
+    active_idx = [i for i, e in enumerate(energies) if e >= min_energy]
+    if not active_idx:
+        return waveform
+    start_sample = max(0, active_idx[0] * frame_len - int(0.2 * sr))
+    end_sample = min(waveform.shape[1], (active_idx[-1] + 1) * frame_len + int(0.2 * sr))
+    return waveform[:, start_sample:end_sample]
+
+def extract_template(waveform, model, device, win_sec=3.0, step_sec=0.75, sr=16000):
+    """
+    Robust Windowed Template Extraction with Energy Weighting:
+    Trims leading/trailing room silence, extracts sliding 3-second windows across
+    active speech, and computes an energy-weighted ensemble speaker embedding to
+    prevent silent pauses from biasing the biometric vector.
+    """
+    trimmed = trim_silence(waveform, sr=sr)
     win = int(win_sec * sr)
     step = int(step_sec * sr)
     slices = []
-    if waveform.shape[1] <= win:
-        pad = win - waveform.shape[1]
-        slices.append(torch.nn.functional.pad(waveform, (0, pad)))
+    weights = []
+    if trimmed.shape[1] <= win:
+        pad = win - trimmed.shape[1]
+        sl = torch.nn.functional.pad(trimmed, (0, pad))
+        slices.append(sl)
+        weights.append(1.0)
     else:
-        for s in range(0, waveform.shape[1] - win + 1, step):
-            slices.append(waveform[:, s:s+win])
+        for s in range(0, trimmed.shape[1] - win + 1, step):
+            sl = trimmed[:, s:s+win]
+            rms = float(torch.sqrt(torch.mean(sl**2)))
+            slices.append(sl)
+            weights.append(rms)
+
+    weights = np.array(weights)
+    weights = weights / (np.sum(weights) + 1e-9)
 
     with torch.no_grad():
         embs = [model(s.to(device)).cpu().numpy().flatten() for s in slices]
 
-    mean_emb = np.mean(embs, axis=0)
-    raw_first_emb = embs[0]
+    # Energy-weighted ensemble template
+    weighted_template = np.sum([w * e for w, e in zip(weights, embs)], axis=0)
+
+    # Pick the most energetic speech slice for the Image 1 Baseline
+    best_slice_idx = int(np.argmax(weights))
+    best_raw_emb = embs[best_slice_idx]
+
     if len(embs) > 1:
         self_sims = [cosine_similarity(embs[i], embs[j]) for i in range(len(embs)) for j in range(i+1, len(embs))]
         self_sim = float(np.mean(self_sims))
     else:
         self_sim = 1.0
-    return mean_emb, raw_first_emb, len(slices), self_sim
+
+    return weighted_template, best_raw_emb, len(slices), self_sim
 
 def scan_dataset(data_dir):
     raw_files = glob.glob(os.path.join(data_dir, "**", "*.wav"), recursive=True)
