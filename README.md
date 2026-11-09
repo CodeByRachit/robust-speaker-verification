@@ -17,9 +17,10 @@ Based on the research paper:
 ## 🌟 Key Highlights
 
 - **Hybrid DL + DSP Architecture**: Combines self-supervised **WavLM** front-end feature extraction and an **ECAPA-TDNN** back-end with closed-form statistical Bayesian **PCA-GMM-MMSE** compensation.
-- **Vocal Effort Invariance**: Restores genuine speaker embeddings distorted by high acoustic intensity (shouting) or glottal airflow reduction (whispering) without retraining the neural network.
+- **Vocal Effort Invariance**: Restores genuine speaker embeddings distorted by high acoustic intensity (shouting) or glottal airflow reduction (whispering) without retraining the deep neural network.
 - **14.45% Equal Error Rate (EER)**: Achieves a **+16.95% relative error reduction** over uncompensated baseline models on the Aalto Vocal Intensity Database (**AVID**).
-- **Interactive Live Microphone Demo**: Includes `src/live_verify.py` to record reference and test utterances directly from your microphone in real time and test biometric verification under normal, shouting, whispering, or impostor conditions.
+- **Acoustic Preprocessing Pipeline**: Includes energy-based **Voice Activity Detection (VAD)**, active speech windowing (3.5s), and **Cepstral Mean & Variance Normalization (CMVN)** to eliminate ambient room noise and microphone gain bias.
+- **Interactive Live Microphone Demo**: Includes [`src/live_verify.py`](src/live_verify.py) to record reference and test utterances directly from your microphone in real time and test biometric verification under normal, shouting, whispering, or impostor conditions.
 
 ---
 
@@ -200,45 +201,36 @@ The project includes an interactive real-time verification tool that records fro
 python3 src/live_verify.py
 ```
 
+### Verification Verdict Card:
 ```
 ==========================================================================================
-   LIVE SPEAKER VERIFICATION SYSTEM: 10-SECOND INTERACTIVE DEMO
-   IEEE MLSP 2023 Implementation: Vocal Effort-Robust Transfer Vector Estimation
+                          SPEAKER VERIFICATION RESULTS
 ==========================================================================================
-Device        : mps (Apple Silicon GPU)
-Model Weights : checkpoint_epoch_20.pth
-Duration      : 10 seconds per recording
-
-[Step 1/3] Loading neural network front-end & back-end...
-  ✓ WavLM + ECAPA-TDNN loaded successfully.
-
-[Step 2/3] Preparing PCA-MMSE statistical estimators...
-  ✓ Loaded cached PCA-MMSE models and global speech mean.
-
---------------------------------------------------------------------------------
-RECORDING 1: ENROLLMENT / REFERENCE VOICE (Normal Speech)
---------------------------------------------------------------------------------
-  Recording: [██████████████████████████████] 10.0s / 10.0s - COMPLETE!
-
---------------------------------------------------------------------------------
-RECORDING 2: TEST VOICE (Speak Normally, Shout, Whisper, or Test Impostor)
---------------------------------------------------------------------------------
-  Recording: [██████████████████████████████] 10.0s / 10.0s - COMPLETE!
-
-[Step 3/3] Running deep feature extraction & Bayesian MMSE compensation...
-
-==========================================================================================
-                          SPEAKER VERIFICATION VERDICT CARD                              
-==========================================================================================
-  Final Verdict     : [ ✓ MATCH ] SAME PERSON
-  Confidence Score  : 97.4%
-  Effort Detected   : Non-Neutral Speech (LOUD / SHOUTING)
-  MMSE Status       : Active (Vocal Effort Transfer Vector Subtracted)
+  Voice 1 (Reference) : voice1_reference.wav
+  Voice 2 (Test)      : voice2_test.wav
 ------------------------------------------------------------------------------------------
-  Pipeline Mode                      | Similarity |   Threshold | Verdict          | Status
+  ┌────────────────────────────────────────────────────────────────────────────────────────┐
+  │                                                                                        │
+  │                   >>> FINAL VERDICT: DIFFERENT PERSON (IMPOSTOR) <<<                   │
+  │                                                                                        │
+  │   Rejection Confidence  : 70.8%                                                        │
+  │   Calibrated Score      : +0.6123  (Threshold tau = 0.6567)                            │
+  │   Margin Below Threshold: -0.0444                                                      │
+  │                                                                                        │
+  └────────────────────────────────────────────────────────────────────────────────────────┘
+
+DETAILED ARCHITECTURAL COMPARISON:
 ------------------------------------------------------------------------------------------
-  Image 1: Baseline (E-T+WavLM)      |     0.8412 |      0.7781 | MATCH            | Raw Uncentered
-  Image 2: Full System (MMSE_v)      |    +0.8841 |      0.6567 | MATCH            | Calibrated Centered
+Pipeline Architecture                | Score      | Threshold   | Decision         | Status
+------------------------------------------------------------------------------------------
+Image 1: Baseline (E-T+WavLM)        |     0.7816 |      0.7781 | SAME PERSON      | Raw Uncentered
+Image 2: Full System (MMSE_v)        |    +0.6123 |      0.6567 | DIFFERENT PERSON | Calibrated Centered
+------------------------------------------------------------------------------------------
+
+SCIENTIFIC EXPLANATION:
+  ✗ The voice utterances originate from DIFFERENT human speakers.
+  ✗ The calibrated similarity (+0.6123) falls significantly below the
+    verification threshold (0.6567), triggering an impostor rejection.
 ==========================================================================================
 ```
 
@@ -266,16 +258,19 @@ pip install torch torchaudio numpy scipy scikit-learn sounddevice
 # 1. Run Interactive Live Microphone Demo
 python3 src/live_verify.py
 
-# 2. Run Live Demo with custom recording duration (e.g., 5 seconds)
+# 2. Run with custom recording duration (e.g., 5 seconds)
 python3 src/live_verify.py --duration 5
 
 # 3. Test verification with pre-recorded audio files
 python3 src/live_verify.py --voice1 recordings/voice1_reference.wav --voice2 recordings/voice2_test.wav
 
-# 4. Run the Full Multi-Speaker Benchmark (200 Genuine & 6,300 Impostor Trials)
+# 4. Explicitly test vocal effort compensation mode (auto, normal, loud, soft)
+python3 src/live_verify.py --effort loud
+
+# 5. Run the Full Multi-Speaker Benchmark (200 Genuine & 6,300 Impostor Trials)
 python3 src/test_speaker_verification.py --speakers 8 --sentences 5
 
-# 5. Run Single Triplet Spotlight Evaluation
+# 6. Run Single Triplet Spotlight Evaluation
 python3 src/test_similarity.py
 ```
 
@@ -296,18 +291,10 @@ robust-speaker-verification/
 │   ├── test_similarity.py           # Single-triplet spotlight evaluation
 │   ├── dataset.py                   # PyTorch Dataset loader with online triplet mining
 │   └── train.py                     # 20-Epoch Triplet Margin training loop
-├── docs/
-│   └── PRESENTATION_GUIDE.md        # Slide deck outline & viva defense cheatsheet
 ├── .gitignore                       # Clean repository exclusions
+├── LICENSE                          # MIT License
 └── README.md                        # Master documentation
 ```
-
----
-
-## 📖 Presentation & Defense Guide
-
-For academic defense questions, viva voce preparation, and presentation slide templates, refer to:
-👉 [**docs/PRESENTATION_GUIDE.md**](docs/PRESENTATION_GUIDE.md)
 
 ---
 
